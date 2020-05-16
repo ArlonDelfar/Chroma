@@ -16,6 +16,7 @@ namespace Chroma.Audio
 
         private Delegate _postMixProcessor;
 
+        private Dictionary<int, List<Delegate>> _channelPostMixProcessors;
         private Dictionary<IntPtr, Sound> _soundBank;
         private Dictionary<IntPtr, Music> _musicBank;
         private int _mixingChannelCount;
@@ -33,8 +34,15 @@ namespace Chroma.Audio
             get => _mixingChannelCount;
             set
             {
+                for (var i = 0; i < _mixingChannelCount; i++)
+                    SDL_mixer.Mix_UnregisterAllEffects(i);
+
                 _mixingChannelCount = value;
+
                 SDL_mixer.Mix_AllocateChannels(_mixingChannelCount);
+
+                for (var i = 0; i < _mixingChannelCount; i++)
+                    SDL_mixer.Mix_RegisterEffect(i, OnChannelPostMix, null, IntPtr.Zero);
             }
         }
 
@@ -57,18 +65,18 @@ namespace Chroma.Audio
             InitializeAudioMixer(AudioFormat.ChromaDefault, 44100, 4096);
         }
 
-        public void InitializeAudioMixer(AudioFormat audioFormat, int samplingRate,  int chunkSize)
+        public void InitializeAudioMixer(AudioFormat audioFormat, int samplingRate, int chunkSize)
         {
             if (_isOpen)
             {
                 Log.Warning("The audio system was already open. Closing it beforehand for you...");
                 ShutdownAudioMixer();
             }
-            
+
             SamplingRate = samplingRate;
             AudioFormat = audioFormat;
             ChunkSize = chunkSize;
-            
+
             var result = SDL_mixer.Mix_OpenAudio(
                 SamplingRate,
                 AudioFormat.SdlMixerFormat,
@@ -85,6 +93,8 @@ namespace Chroma.Audio
                 _soundBank = new Dictionary<IntPtr, Sound>();
                 _musicBank = new Dictionary<IntPtr, Music>();
 
+                _channelPostMixProcessors = new Dictionary<int, List<Delegate>>();
+
                 _channelFinished = OnChannelFinished;
                 _musicFinished = OnMusicFinished;
                 _postMixFunc = OnPostMix;
@@ -94,7 +104,7 @@ namespace Chroma.Audio
                 SDL_mixer.Mix_ChannelFinished(_channelFinished);
                 SDL_mixer.Mix_HookMusicFinished(_musicFinished);
                 SDL_mixer.Mix_SetPostMix(_postMixFunc, IntPtr.Zero);
-                
+
                 _isOpen = true;
             }
         }
@@ -102,6 +112,8 @@ namespace Chroma.Audio
         public void ShutdownAudioMixer()
         {
             UnhookPostMixProcessor();
+            UnhookChannelPostMixProcessors();
+            
             SDL_mixer.Mix_ChannelFinished(null);
             SDL_mixer.Mix_HookMusicFinished(null);
 
@@ -110,6 +122,7 @@ namespace Chroma.Audio
                 sound.Disposing -= AudioResourceDisposing;
                 sound.Dispose();
             }
+
             _soundBank.Clear();
 
             foreach (var track in _musicBank.Values)
@@ -117,6 +130,7 @@ namespace Chroma.Audio
                 track.Disposing -= AudioResourceDisposing;
                 track.Dispose();
             }
+
             _musicBank.Clear();
 
             SDL_mixer.Mix_CloseAudio();
@@ -173,6 +187,68 @@ namespace Chroma.Audio
         public IEnumerable<Sound> FindSoundsByActualChannel(int channel)
             => _soundBank.Values.Where(sound => sound.ActualChannel == channel);
 
+        public void HookPostMixProcessorFor<T>(int channel, PostMixWaveformProcessor<T> func) where T : struct
+        {
+            if (!_channelPostMixProcessors.ContainsKey(channel))
+                _channelPostMixProcessors.Add(channel, new List<Delegate>());
+
+            if (typeof(T) == typeof(float) && AudioFormat.SampleFormat == SampleFormat.F32)
+            {
+                _channelPostMixProcessors[channel].Add(
+                    func.Method.CreateDelegate(
+                        typeof(PostMixWaveformProcessor<float>),
+                        func.Target
+                    )
+                );
+            }
+            else if (typeof(T) == typeof(int) && AudioFormat.SampleFormat == SampleFormat.S32)
+            {
+                _channelPostMixProcessors[channel].Add(
+                    func.Method.CreateDelegate(
+                        typeof(PostMixWaveformProcessor<int>),
+                        func.Target
+                    )
+                );
+            }
+            else if (typeof(T) == typeof(short) && AudioFormat.SampleFormat == SampleFormat.S16)
+            {
+                _channelPostMixProcessors[channel].Add(
+                    func.Method.CreateDelegate(
+                        typeof(PostMixWaveformProcessor<short>),
+                        func.Target
+                    )
+                );
+            }
+            else if (typeof(T) == typeof(ushort) && AudioFormat.SampleFormat == SampleFormat.U16)
+            {
+                _channelPostMixProcessors[channel].Add(
+                    func.Method.CreateDelegate(
+                        typeof(PostMixWaveformProcessor<ushort>),
+                        func.Target
+                    )
+                );
+            }
+            else if (typeof(T) == typeof(sbyte) && AudioFormat.SampleFormat == SampleFormat.S8)
+            {
+                _channelPostMixProcessors[channel].Add(
+                    func.Method.CreateDelegate(
+                        typeof(PostMixWaveformProcessor<sbyte>),
+                        func.Target
+                    )
+                );
+            }
+            else if (typeof(T) == typeof(byte) && AudioFormat.SampleFormat == SampleFormat.U8)
+            {
+                _channelPostMixProcessors[channel].Add(
+                    func.Method.CreateDelegate(
+                        typeof(PostMixWaveformProcessor<byte>),
+                        func.Target
+                    )
+                );
+            }
+            else throw new ArgumentException("Unsupported sample type or sample type mismatch.");
+        }
+
         public void HookPostMixProcessor<T>(PostMixWaveformProcessor<T> func) where T : struct
         {
             if (typeof(T) == typeof(float) && AudioFormat.SampleFormat == SampleFormat.F32)
@@ -223,6 +299,14 @@ namespace Chroma.Audio
         public void UnhookPostMixProcessor()
             => _postMixProcessor = null;
 
+        public void UnhookChannelPostMixProcessors()
+        {
+            foreach (var kvp in _channelPostMixProcessors)
+                kvp.Value.Clear();
+            
+            _channelPostMixProcessors.Clear();
+        }
+
         internal PlaybackStatus BeginMusicPlayback(Music music)
         {
             if (music.Status == PlaybackStatus.Playing)
@@ -268,7 +352,7 @@ namespace Chroma.Audio
         {
             var handle = SDL_mixer.Mix_GetChunk(channel);
 
-            if (_soundBank.TryGetValue(handle, out Sound sound))
+            if (_soundBank.TryGetValue(handle, out var sound))
             {
                 sound.Status = PlaybackStatus.Stopped;
                 SoundPlaybackFinished?.Invoke(this, new SoundEventArgs(sound));
@@ -285,45 +369,57 @@ namespace Chroma.Audio
             MusicPlaybackFinished?.Invoke(this, new MusicEventArgs(music));
         }
 
-        internal void OnPostMix(IntPtr udata, IntPtr stream, int length)
+        internal unsafe void OnPostMix(IntPtr udata, IntPtr stream, int length)
+            => RunProcessors(stream.ToPointer(), length, _postMixProcessor);
+
+        internal unsafe void OnChannelPostMix(int chan, IntPtr stream, int length, IntPtr udata)
         {
-            unsafe
+            if (_channelPostMixProcessors.ContainsKey(chan))
             {
                 void* streamPtr = stream.ToPointer();
 
-                if (AudioFormat.SampleFormat == SampleFormat.F32)
-                {
-                    var deleg = _postMixProcessor as PostMixWaveformProcessor<float>;
-                    deleg?.Invoke(new Span<float>(streamPtr, length / sizeof(float)),
-                        new Span<byte>(streamPtr, length));
-                }
-                else if (AudioFormat.SampleFormat == SampleFormat.S32)
-                {
-                    var deleg = _postMixProcessor as PostMixWaveformProcessor<int>;
-                    deleg?.Invoke(new Span<int>(streamPtr, length / sizeof(int)), new Span<byte>(streamPtr, length));
-                }
-                else if (AudioFormat.SampleFormat == SampleFormat.S16)
-                {
-                    var deleg = _postMixProcessor as PostMixWaveformProcessor<short>;
-                    deleg?.Invoke(new Span<short>(streamPtr, length / sizeof(short)),
-                        new Span<byte>(streamPtr, length));
-                }
-                else if (AudioFormat.SampleFormat == SampleFormat.U16)
-                {
-                    var deleg = _postMixProcessor as PostMixWaveformProcessor<ushort>;
-                    deleg?.Invoke(new Span<ushort>(streamPtr, length / sizeof(ushort)),
-                        new Span<byte>(streamPtr, length));
-                }
-                else if (AudioFormat.SampleFormat == SampleFormat.S8)
-                {
-                    var deleg = _postMixProcessor as PostMixWaveformProcessor<sbyte>;
-                    deleg?.Invoke(new Span<sbyte>(streamPtr, length), new Span<byte>(streamPtr, length));
-                }
-                else if (AudioFormat.SampleFormat == SampleFormat.U8)
-                {
-                    var deleg = _postMixProcessor as PostMixWaveformProcessor<byte>;
-                    deleg?.Invoke(new Span<byte>(streamPtr, length), new Span<byte>(streamPtr, length));
-                }
+                foreach (var d in _channelPostMixProcessors[chan])
+                    RunProcessors(streamPtr, length, d);
+            }
+        }
+
+        internal unsafe void RunProcessors(void* streamPtr, int length, Delegate d)
+        {
+            if (AudioFormat.SampleFormat == SampleFormat.F32)
+            {
+                var deleg = d as PostMixWaveformProcessor<float>;
+                deleg?.Invoke(new Span<float>(streamPtr, length / sizeof(float)),
+                    new Span<byte>(streamPtr, length));
+            }
+            else if (AudioFormat.SampleFormat == SampleFormat.S32)
+            {
+                var deleg = d as PostMixWaveformProcessor<int>;
+                deleg?.Invoke(new Span<int>(streamPtr, length / sizeof(int)), 
+                    new Span<byte>(streamPtr, length));
+            }
+            else if (AudioFormat.SampleFormat == SampleFormat.S16)
+            {
+                var deleg = d as PostMixWaveformProcessor<short>;
+                deleg?.Invoke(new Span<short>(streamPtr, length / sizeof(short)),
+                    new Span<byte>(streamPtr, length));
+            }
+            else if (AudioFormat.SampleFormat == SampleFormat.U16)
+            {
+                var deleg = d as PostMixWaveformProcessor<ushort>;
+                deleg?.Invoke(new Span<ushort>(streamPtr, length / sizeof(ushort)),
+                    new Span<byte>(streamPtr, length));
+            }
+            else if (AudioFormat.SampleFormat == SampleFormat.S8)
+            {
+                var deleg = d as PostMixWaveformProcessor<sbyte>;
+                deleg?.Invoke(new Span<sbyte>(streamPtr, length), 
+                    new Span<byte>(streamPtr, length));
+            }
+            else if (AudioFormat.SampleFormat == SampleFormat.U8)
+            {
+                var deleg = d as PostMixWaveformProcessor<byte>;
+                deleg?.Invoke(new Span<byte>(streamPtr, length), 
+                    new Span<byte>(streamPtr, length));
             }
         }
 
